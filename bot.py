@@ -357,29 +357,24 @@ def iter_block_items(parent):
 
 
 def escape_for_platypus_paragraph(text: str) -> str:
-    """
-    حماية النص من تحليل وسوم XML في reportlab مع الحفاظ على الرموز قدر الإمكان.
-    """
-    escaped = (
+    return (
         text.replace("&", "&amp;")
         .replace("<", "&lt;")
         .replace(">", "&gt;")
     )
-    return escaped
 
 
 def format_for_pdf_paragraph(text: str, use_arabic_font: bool) -> str:
-    escaped = escape_for_platypus_paragraph(text)
     if has_arabic(text) and use_arabic_font and HAS_ARABIC_SHAPER:
         try:
-            # تجنب قلب الأرقام التسلسلية الواضحة عبر reshaper إذا كان السطر أرقام ورموز فقط
             if re.fullmatch(r"[\d\s\.\,\-\/\:\+\=\(\)\[\]\{\}%$€£]+", text.strip()):
-                return escaped
-            reshaped = arabic_reshaper.reshape(escaped)
-            return get_display(reshaped)
+                return escape_for_platypus_paragraph(text)
+            reshaped = arabic_reshaper.reshape(text)
+            bidi_text = get_display(reshaped)
+            return escape_for_platypus_paragraph(bidi_text)
         except Exception:
-            return escaped
-    return escaped
+            return escape_for_platypus_paragraph(text)
+    return escape_for_platypus_paragraph(text)
 
 
 def convert_word_to_pdf(docx_file_path: str, pdf_file_path: str):
