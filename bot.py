@@ -6,7 +6,7 @@ import tempfile
 from collections import Counter
 from docx import Document
 from docx.shared import Pt
-from pypdf import PdfReader
+import pdfplumber
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
@@ -29,8 +29,8 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "أهلاً بك! أرسل لي:\n"
-        "• ملف PDF لتحويله إلى Word (.docx) مع إزالة النصوص المكررة وتنسيق الجداول والفقرات.\n"
-        "• أو ملف Word (.docx) لتحويله إلى PDF (.pdf) مع الحفاظ على الجداول والتنسيق قدر الإمكان."
+        "• ملف PDF لتحويله إلى Word (.docx) مع إزالة النصوص المكررة واستخراج الجداول.\n"
+        "• أو ملف Word (.docx) لتحويله إلى PDF (.pdf) مع الحفاظ على الجداول والتنسيق."
     )
 
 
@@ -94,8 +94,30 @@ def fix_arabic_text(text: str) -> str:
     for wrong, right in common_fixes.items():
         text = re.sub(rf"\b{re.escape(wrong)}\b", right, text)
 
+    text = re.sub(r"([\u0600-\u06FFA-Za-z])(\d)", r"\1 \2", text)
+    text = re.sub(r"(\d)([\u0600-\u06FFA-Za-z])", r"\1 \2", text)
     text = re.sub(r"[ \t]+", " ", text)
     return text.strip()
+
+
+def normalize_for_dedup(text: str) -> str:
+    s = text.lower()
+    s = re.sub(r"[أإآا]", "ا", s)
+    s = re.sub(r"[ىي]", "ي", s)
+    s = re.sub(r"ة", "ه", s)
+    s = re.sub(r"[^\w\u0600-\u06FF]+", "", s)
+    return s.strip()
+
+
+def is_junk_short_line(line: str) -> bool:
+    s = line.strip()
+    if not s:
+        return True
+    if re.fullmatch(r"[\-\—\_\.\|\s/\\]+", s):
+        return True
+    if s in {"Word DF", "TLFixERR-001_AR%"}:
+        return True
+    return False
 
 
 def shape_for_reportlab(text: str) -> str:
@@ -125,178 +147,139 @@ def find_ttf_font() -> str | None:
     return found[0] if found else None
 
 
-def parse_table_row_if_any(line: str) -> list[str] | None:
-    """
-    يكتشف فقط السطور الواضحة التي تحتوي على أعمدة نصية مفصولة بـ '|'.
-    """
-    if "|" not in line:
-        return None
-    cells = [c.strip() for c in line.split("|") if c.strip()]
-    if len(cells) < 2:
-        return None
-    # تجاهل الأسطر التي كلها رموز فقط بدون حروف أو أرقام مفيدة
-    meaningful = [c for c in cells if re.search(r"[\w\u0600-\u06FF]", c)]
-    if len(meaningful) < 2:
-        return None
-    return cells
+def add_table_to_docx(word_doc: Document, raw_rows: list[list[str | None]]):
+    cleaned_rows: list[list[str]] = []
+    for row in raw_rows:
+        cells = [fix_arabic_text((c or "").replace("\n", " ")) for c in row]
+        if any(cells):
+            cleaned_rows.append(cells)
 
-
-def add_lines_with_tables_to_docx(word_doc: Document, lines: list[str]):
-    """
-    يضيف الأسطر لملف Word مع بناء جدول حقيقي فقط إذا وجد صفان متتاليان أو أكثر.
-    """
-    pending_table_rows: list[list[str]] = []
-
-    def flush_table():
-        nonlocal pending_table_rows
-        if not pending_table_rows:
-            return
-
-        # لو صف واحد فقط أو أقل من صفين، نكتبه كفقرة عادية بدل جدول مبعثر
-        if len(pending_table_rows) < 2:
-            for r in pending_table_rows:
-                joined = " | ".join(r)
-                p = word_doc.add_paragraph(joined)
+    if len(cleaned_rows) < 2:
+        for r in cleaned_rows:
+            line = " | ".join([c for c in r if c])
+            if line:
+                p = word_doc.add_paragraph(line)
                 p.paragraph_format.space_after = Pt(4)
-                if has_arabic(joined):
+                if has_arabic(line):
                     p.paragraph_format.bidi = True
-            pending_table_rows = []
-            return
+        return
 
-        max_cols = min(6, max(len(r) for r in pending_table_rows))
-        tbl = word_doc.add_table(rows=len(pending_table_rows), cols=max_cols)
-        tbl.style = "Table Grid"
+    max_cols = min(6, max(len(r) for r in cleaned_rows))
+    tbl = word_doc.add_table(rows=len(cleaned_rows), cols=max_cols)
+    tbl.style = "Table Grid"
 
-        for r_idx, row_data in enumerate(pending_table_rows):
-            for c_idx in range(max_cols):
-                cell_text = row_data[c_idx] if c_idx < len(row_data) else ""
-                cell = tbl.cell(r_idx, c_idx)
-                cell.text = cell_text
-                for p in cell.paragraphs:
-                    p.paragraph_format.space_after = Pt(2)
-                    if has_arabic(cell_text):
-                        p.paragraph_format.bidi = True
+    for r_idx, row_data in enumerate(cleaned_rows):
+        for c_idx in range(max_cols):
+            cell_text = row_data[c_idx] if c_idx < len(row_data) else ""
+            cell = tbl.cell(r_idx, c_idx)
+            cell.text = cell_text
+            for p in cell.paragraphs:
+                p.paragraph_format.space_after = Pt(2)
+                if has_arabic(cell_text):
+                    p.paragraph_format.bidi = True
 
-        word_doc.add_paragraph("")
-        pending_table_rows = []
-
-    for line in lines:
-        row_cells = parse_table_row_if_any(line)
-        if row_cells:
-            pending_table_rows.append(row_cells)
-            continue
-
-        flush_table()
-
-        is_heading = bool(
-            re.match(
-                r"^(\d+[\.\)]\s+.{2,60}|السؤال\s+\S+|أولاً|ثانياً|ثالثاً|رابعاً|خامساً|سادساً|سابعاً)",
-                line,
-            )
-            and len(line) <= 90
-        )
-
-        if is_heading:
-            h = word_doc.add_paragraph()
-            run = h.add_run(line)
-            run.bold = True
-            run.font.size = Pt(12)
-            h.paragraph_format.space_before = Pt(6)
-            h.paragraph_format.space_after = Pt(3)
-            if has_arabic(line):
-                h.paragraph_format.bidi = True
-        else:
-            p = word_doc.add_paragraph(line)
-            p.paragraph_format.space_after = Pt(4)
-            if has_arabic(line):
-                p.paragraph_format.bidi = True
-
-    flush_table()
-
-
-def is_junk_short_line(line: str) -> bool:
-    s = line.strip()
-    if not s:
-        return True
-    if re.fullmatch(r"[\-\—\_\.\|\s/\\]+", s):
-        return True
-    if s in {"Word DF", "TLFixERR-001_AR%"}:
-        return True
-    return False
+    word_doc.add_paragraph("")
 
 
 def convert_pdf_to_word(pdf_file_path: str, docx_file_path: str):
-    reader = PdfReader(pdf_file_path)
-    total_pages = len(reader.pages)
     word_doc = Document()
-
     normal_style = word_doc.styles["Normal"]
     normal_style.font.name = "Arial"
     normal_style.font.size = Pt(11)
 
-    if total_pages == 0:
-        word_doc.add_paragraph("الملف فارغ.")
-        word_doc.save(docx_file_path)
-        return
+    with pdfplumber.open(pdf_file_path) as pdf:
+        total_pages = len(pdf.pages)
+        if total_pages == 0:
+            word_doc.add_paragraph("الملف فارغ.")
+            word_doc.save(docx_file_path)
+            return
 
-    pages_raw_lines = []
-    global_line_counter = Counter()
+        pages_data = []
+        global_norm_counter = Counter()
 
-    for page in reader.pages:
-        raw_text = page.extract_text() or ""
-        current_lines = []
-        seen_in_page = set()
+        for page in pdf.pages:
+            raw_text = page.extract_text() or ""
+            tables = page.extract_tables() or []
 
-        for raw_line in raw_text.splitlines():
-            cleaned = fix_arabic_text(raw_line)
-            if not cleaned or is_junk_short_line(cleaned):
-                continue
-            current_lines.append(cleaned)
-            if len(cleaned) >= 6:
-                seen_in_page.add(cleaned)
+            current_lines = []
+            seen_norm_in_page = set()
 
-        pages_raw_lines.append(current_lines)
-        for item in seen_in_page:
-            global_line_counter[item] += 1
+            for raw_line in raw_text.splitlines():
+                cleaned = fix_arabic_text(raw_line)
+                if not cleaned or is_junk_short_line(cleaned):
+                    continue
+                current_lines.append(cleaned)
+                norm = normalize_for_dedup(cleaned)
+                if len(norm) >= 6:
+                    seen_norm_in_page.add(norm)
 
-    cross_page_threshold = max(2, (total_pages // 2) + 1) if total_pages > 1 else 999999
-    repeated_across_pages = {
-        item for item, count in global_line_counter.items() if count >= cross_page_threshold
-    }
+            pages_data.append((current_lines, tables))
+            for item in seen_norm_in_page:
+                global_norm_counter[item] += 1
 
-    for page_num, lines in enumerate(pages_raw_lines, start=1):
-        heading = word_doc.add_heading(f"صفحة {page_num}", level=2)
-        heading.paragraph_format.bidi = True
+        cross_page_threshold = max(2, (total_pages // 2) + 1) if total_pages > 1 else 999999
+        repeated_across_pages = {
+            item for item, count in global_norm_counter.items() if count >= cross_page_threshold
+        }
 
-        local_counter = Counter(lines)
-        seen_long_in_page = set()
-        clean_page_lines = []
+        for page_num, (lines, tables) in enumerate(pages_data, start=1):
+            heading = word_doc.add_heading(f"صفحة {page_num}", level=2)
+            heading.paragraph_format.bidi = True
 
-        for line in lines:
-            if line in repeated_across_pages:
-                continue
-            if len(line) >= 5 and local_counter[line] > 2:
-                continue
-            if clean_page_lines and clean_page_lines[-1] == line:
-                continue
-            # منع تكرار الجمل الطويلة داخل نفس الصفحة
-            if len(line) >= 25 and line in seen_long_in_page:
-                continue
+            norm_list = [normalize_for_dedup(l) for l in lines]
+            local_norm_counter = Counter(n for n in norm_list if len(n) >= 5)
+            seen_long_norm_in_page = set()
+            clean_page_lines = []
 
-            clean_page_lines.append(line)
-            if len(line) >= 25:
-                seen_long_in_page.add(line)
+            for line in lines:
+                norm = normalize_for_dedup(line)
+                if norm in repeated_across_pages:
+                    continue
+                if len(norm) >= 5 and local_norm_counter[norm] > 2:
+                    continue
+                if clean_page_lines and normalize_for_dedup(clean_page_lines[-1]) == norm and len(norm) >= 4:
+                    continue
+                if len(norm) >= 20 and norm in seen_long_norm_in_page:
+                    continue
 
-        if not clean_page_lines:
-            p = word_doc.add_paragraph(
-                "لا يوجد نص قابل للاستخراج في هذه الصفحة (قد تكون صفحة مصورة أو ممسوحة ضوئياً)."
-            )
-            p.paragraph_format.bidi = True
-        else:
-            add_lines_with_tables_to_docx(word_doc, clean_page_lines)
+                clean_page_lines.append(line)
+                if len(norm) >= 20:
+                    seen_long_norm_in_page.add(norm)
 
-        if page_num < total_pages:
-            word_doc.add_page_break()
+            if not clean_page_lines and not tables:
+                p = word_doc.add_paragraph(
+                    "لا يوجد نص قابل للاستخراج في هذه الصفحة (قد تكون صفحة مصورة أو ممسوحة ضوئياً)."
+                )
+                p.paragraph_format.bidi = True
+            else:
+                for line in clean_page_lines:
+                    is_heading = bool(
+                        re.match(
+                            r"^(\d+[\.\)]\s+.{2,60}|السؤال\s+\S+|أولاً|ثانياً|ثالثاً|رابعاً|خامساً|سادساً|سابعاً)",
+                            line,
+                        )
+                        and len(line) <= 90
+                    )
+                    if is_heading:
+                        h = word_doc.add_paragraph()
+                        run = h.add_run(line)
+                        run.bold = True
+                        run.font.size = Pt(12)
+                        h.paragraph_format.space_before = Pt(6)
+                        h.paragraph_format.space_after = Pt(3)
+                        if has_arabic(line):
+                            h.paragraph_format.bidi = True
+                    else:
+                        p = word_doc.add_paragraph(line)
+                        p.paragraph_format.space_after = Pt(4)
+                        if has_arabic(line):
+                            p.paragraph_format.bidi = True
+
+                for tbl_rows in tables:
+                    add_table_to_docx(word_doc, tbl_rows)
+
+            if page_num < total_pages:
+                word_doc.add_page_break()
 
     word_doc.save(docx_file_path)
 
