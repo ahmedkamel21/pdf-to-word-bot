@@ -5,7 +5,7 @@ import re
 import tempfile
 from collections import Counter
 from docx import Document
-from pypdf import PdfReader, PdfWriter
+from pypdf import PdfReader
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
@@ -26,7 +26,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "أهلاً بك! أرسل لي:\n"
-        "• ملف PDF لتحويله إلى Word (.docx) مع محاولة إزالة النصوص المكررة وتحسين النص العربي.\n"
+        "• ملف PDF لتحويله إلى Word (.docx) مع إزالة النصوص المكررة وتحسين النص العربي.\n"
         "• أو ملف Word (.docx) لتحويله إلى PDF (.pdf)."
     )
 
@@ -36,17 +36,13 @@ def has_arabic(text: str) -> bool:
 
 
 def fix_arabic_text(text: str) -> str:
-    """
-    تحسين شائع للنصوص العربية المستخرجة من بعض ملفات PDF القديمة أو خطوط غير قياسية.
-    """
     if not text:
         return ""
 
-    # إزالة مسافات التمديد الزائدة وبعض الحروف الشاذة الشائعة في خطوط PDF القديمة
     replacements = {
         "\u0640": "",  # إزالة التطويل/الكشيدة الزائدة
-        "ى ": "ي ",
-        "ى\n": "ي\n",
+        "\u200f": "",  # إزالة علامة RTL الخفية إن وجدت
+        "\u200e": "",  # إزالة علامة LTR الخفية إن وجدت
         "ٌ": "",
         "ٍ": "",
         "َ": "",
@@ -58,22 +54,17 @@ def fix_arabic_text(text: str) -> str:
     for old, new in replacements.items():
         text = text.replace(old, new)
 
-    # تصحيح كلمات شائعة تظهر أحيانًا بـ "ى" بدل "ي" في نهاية أو وسط الكلمة في بعض ملفات PDF
     common_fixes = {
         "التى": "التي",
         "فى": "في",
         "الذى": "الذي",
         "الثانى": "الثاني",
         "الثالث": "الثالث",
-        "السؤال الثانى": "السؤال الثاني",
-        "السؤال الثالث": "السؤال الثالث",
         "الفصل الدراسى": "الفصل الدراسي",
-        "تستطيع": "تستطيع",
     }
     for wrong, right in common_fixes.items():
         text = re.sub(rf"\b{re.escape(wrong)}\b", right, text)
 
-    # ترتيب المسافات الزائدة داخل السطر
     text = re.sub(r"[ \t]+", " ", text)
     return text.strip()
 
@@ -103,94 +94,88 @@ def find_ttf_font() -> str | None:
     return found[0] if found else None
 
 
-def remove_repeated_text_objects(reader: PdfReader) -> PdfWriter:
-    writer = PdfWriter()
-    total_pages = len(reader.pages)
-    if total_pages == 0:
-        return writer
-
-    line_counter = Counter()
-
-    for page in reader.pages:
-        lines_in_page = set()
-        raw_text = page.extract_text() or ""
-        for line in raw_text.splitlines():
-            clean_line = fix_arabic_text(line)
-            if len(clean_line) >= 4:
-                lines_in_page.add(clean_line)
-        for item in lines_in_page:
-            line_counter[item] += 1
-
-    threshold = max(2, int(total_pages * 0.6)) if total_pages > 2 else 999999
-    repeated_lines = {item for item, count in line_counter.items() if count >= threshold}
-
-    for page in reader.pages:
-        if repeated_lines:
-            try:
-                page.remove_text(
-                    visitor_text=lambda text, cm, tm, font_dict, font_size: (
-                        "" if fix_arabic_text(text or "") in repeated_lines else text
-                    )
-                )
-            except Exception:
-                pass
-        writer.add_page(page)
-
-    return writer
+def is_explicit_watermark(line: str) -> bool:
+    lower = line.lower()
+    watermark_keywords = [
+        "watermark",
+        "confidential",
+        "نسخة تجريبية للمراجعة",
+    ]
+    return any(kw in lower for kw in watermark_keywords)
 
 
 def convert_pdf_to_word(pdf_file_path: str, docx_file_path: str):
     reader = PdfReader(pdf_file_path)
-    writer = remove_repeated_text_objects(reader)
-
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_clean_pdf:
-        cleaned_pdf_path = tmp_clean_pdf.name
-        writer.write(cleaned_pdf_path)
-
-    try:
-        clean_reader = PdfReader(cleaned_pdf_path)
+    total_pages = len(reader.pages)
+    if total_pages == 0:
         word_doc = Document()
-
-        # ضبط نمط الفقرة الافتراضي
-        normal_style = word_doc.styles["Normal"]
-        normal_style.font.name = "Arial"
-
-        for page_num, page in enumerate(clean_reader.pages, start=1):
-            heading = word_doc.add_heading(f"صفحة {page_num}", level=2)
-            heading.paragraph_format.bidi = True
-
-            extracted_text = page.extract_text() or ""
-            raw_lines = extracted_text.splitlines()
-
-            cleaned_lines = []
-            for line in raw_lines:
-                fixed = fix_arabic_text(line)
-                if fixed:
-                    cleaned_lines.append(fixed)
-
-            if not cleaned_lines:
-                p = word_doc.add_paragraph(
-                    "لا يوجد نص قابل للاستخراج في هذه الصفحة (قد تكون صفحة مصورة أو ممسوحة ضوئياً)."
-                )
-                p.paragraph_format.bidi = True
-            else:
-                for line in cleaned_lines:
-                    # فصل الأسئلة الرئيسية في فقرة مستقلة لسهولة القراءة
-                    if re.match(r"^(السؤال\s+\S+|أولاً|ثانياً|ثالثاً|رابعاً|خامساً|سادساً|سابعاً)", line):
-                        word_doc.add_paragraph("")
-
-                    paragraph = word_doc.add_paragraph(line)
-                    paragraph.paragraph_format.space_after = 4
-                    if has_arabic(line):
-                        paragraph.paragraph_format.bidi = True
-
-            if page_num < len(clean_reader.pages):
-                word_doc.add_page_break()
-
+        word_doc.add_paragraph("الملف فارغ.")
         word_doc.save(docx_file_path)
-    finally:
-        if os.path.exists(cleaned_pdf_path):
-            os.remove(cleaned_pdf_path)
+        return
+
+    pages_lines = []
+    line_page_counter = Counter()
+
+    for page in reader.pages:
+        raw_text = page.extract_text() or ""
+        page_unique = set()
+        current_page_lines = []
+
+        for raw_line in raw_text.splitlines():
+            cleaned = fix_arabic_text(raw_line)
+            if not cleaned:
+                continue
+            current_page_lines.append(cleaned)
+            if len(cleaned) >= 4:
+                page_unique.add(cleaned)
+
+        pages_lines.append(current_page_lines)
+        for item in page_unique:
+            line_page_counter[item] += 1
+
+    threshold = max(2, int(total_pages * 0.6)) if total_pages > 2 else 999999
+    repeated_watermarks = {
+        item for item, count in line_page_counter.items() if count >= threshold
+    }
+
+    word_doc = Document()
+    normal_style = word_doc.styles["Normal"]
+    normal_style.font.name = "Arial"
+
+    for page_num, lines in enumerate(pages_lines, start=1):
+        heading = word_doc.add_heading(f"صفحة {page_num}", level=2)
+        heading.paragraph_format.bidi = True
+
+        filtered_lines = []
+        prev_line = None
+
+        for line in lines:
+            if is_explicit_watermark(line) or line in repeated_watermarks:
+                continue
+            if line == prev_line:
+                continue
+            filtered_lines.append(line)
+            prev_line = line
+
+        if not filtered_lines:
+            p = word_doc.add_paragraph(
+                "لا يوجد نص قابل للاستخراج في هذه الصفحة (قد تكون صفحة مصورة أو ممسوحة ضوئياً)."
+            )
+            p.paragraph_format.bidi = True
+        else:
+            for line in filtered_lines:
+                if re.match(r"^(\d+[\.\-]|السؤال\s+\S+|أولاً|ثانياً|ثالثاً|رابعاً|خامساً|سادساً|سابعاً)", line):
+                    word_doc.add_paragraph("")
+
+                p = word_doc.add_paragraph(line)
+                p.paragraph_format.space_after = 4
+                if has_arabic(line):
+                    p.paragraph_format.bidi = True
+
+        if page_num < total_pages:
+            word_doc.add_page_break()
+
+    word_doc.save(docx_file_path)
 
 
 def convert_word_to_pdf(docx_file_path: str, pdf_file_path: str):
