@@ -5,7 +5,7 @@ import re
 import tempfile
 from collections import Counter
 from docx import Document
-from docx.shared import Inches, Pt
+from docx.shared import Pt
 from pypdf import PdfReader
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
@@ -127,18 +127,23 @@ def find_ttf_font() -> str | None:
 
 def parse_table_row_if_any(line: str) -> list[str] | None:
     """
-    يكتشف إذا كان السطر يمثل صف جدول (مفصول بـ '|' أو أعمدة متعددة واضحة).
+    يكتشف فقط السطور الواضحة التي تحتوي على أعمدة نصية مفصولة بـ '|'.
     """
-    if "|" in line:
-        cells = [c.strip() for c in line.split("|") if c.strip()]
-        if len(cells) >= 2:
-            return cells
-    return None
+    if "|" not in line:
+        return None
+    cells = [c.strip() for c in line.split("|") if c.strip()]
+    if len(cells) < 2:
+        return None
+    # تجاهل الأسطر التي كلها رموز فقط بدون حروف أو أرقام مفيدة
+    meaningful = [c for c in cells if re.search(r"[\w\u0600-\u06FF]", c)]
+    if len(meaningful) < 2:
+        return None
+    return cells
 
 
 def add_lines_with_tables_to_docx(word_doc: Document, lines: list[str]):
     """
-    يضيف الأسطر لملف Word مع تحويل تسلسل صفوف الجدول إلى جدول حقيقي.
+    يضيف الأسطر لملف Word مع بناء جدول حقيقي فقط إذا وجد صفان متتاليان أو أكثر.
     """
     pending_table_rows: list[list[str]] = []
 
@@ -147,15 +152,18 @@ def add_lines_with_tables_to_docx(word_doc: Document, lines: list[str]):
         if not pending_table_rows:
             return
 
-        max_cols = max(len(r) for r in pending_table_rows)
-        if max_cols < 2:
+        # لو صف واحد فقط أو أقل من صفين، نكتبه كفقرة عادية بدل جدول مبعثر
+        if len(pending_table_rows) < 2:
             for r in pending_table_rows:
-                p = word_doc.add_paragraph(" | ".join(r))
-                if has_arabic(" ".join(r)):
+                joined = " | ".join(r)
+                p = word_doc.add_paragraph(joined)
+                p.paragraph_format.space_after = Pt(4)
+                if has_arabic(joined):
                     p.paragraph_format.bidi = True
             pending_table_rows = []
             return
 
+        max_cols = min(6, max(len(r) for r in pending_table_rows))
         tbl = word_doc.add_table(rows=len(pending_table_rows), cols=max_cols)
         tbl.style = "Table Grid"
 
@@ -206,6 +214,17 @@ def add_lines_with_tables_to_docx(word_doc: Document, lines: list[str]):
     flush_table()
 
 
+def is_junk_short_line(line: str) -> bool:
+    s = line.strip()
+    if not s:
+        return True
+    if re.fullmatch(r"[\-\—\_\.\|\s/\\]+", s):
+        return True
+    if s in {"Word DF", "TLFixERR-001_AR%"}:
+        return True
+    return False
+
+
 def convert_pdf_to_word(pdf_file_path: str, docx_file_path: str):
     reader = PdfReader(pdf_file_path)
     total_pages = len(reader.pages)
@@ -230,7 +249,7 @@ def convert_pdf_to_word(pdf_file_path: str, docx_file_path: str):
 
         for raw_line in raw_text.splitlines():
             cleaned = fix_arabic_text(raw_line)
-            if not cleaned or cleaned in {"|", "/", "-", "—", "."}:
+            if not cleaned or is_junk_short_line(cleaned):
                 continue
             current_lines.append(cleaned)
             if len(cleaned) >= 6:
@@ -250,7 +269,9 @@ def convert_pdf_to_word(pdf_file_path: str, docx_file_path: str):
         heading.paragraph_format.bidi = True
 
         local_counter = Counter(lines)
+        seen_long_in_page = set()
         clean_page_lines = []
+
         for line in lines:
             if line in repeated_across_pages:
                 continue
@@ -258,7 +279,13 @@ def convert_pdf_to_word(pdf_file_path: str, docx_file_path: str):
                 continue
             if clean_page_lines and clean_page_lines[-1] == line:
                 continue
+            # منع تكرار الجمل الطويلة داخل نفس الصفحة
+            if len(line) >= 25 and line in seen_long_in_page:
+                continue
+
             clean_page_lines.append(line)
+            if len(line) >= 25:
+                seen_long_in_page.add(line)
 
         if not clean_page_lines:
             p = word_doc.add_paragraph(
@@ -302,7 +329,7 @@ def convert_word_to_pdf(docx_file_path: str, pdf_file_path: str):
         fontName=font_name,
         fontSize=11,
         leading=18,
-        alignment=2 if font_name != "Helvetica" else 0,  # يمين للعربي عند توفر خط TTF
+        alignment=2 if font_name != "Helvetica" else 0,
         spaceAfter=6,
     )
     ltr_style = ParagraphStyle(
@@ -318,7 +345,6 @@ def convert_word_to_pdf(docx_file_path: str, pdf_file_path: str):
     story = []
     has_content = False
 
-    # المرور على العناصر بالترتيب الأصلي قدر الإمكان
     for p in doc.paragraphs:
         txt = fix_arabic_text(p.text or "")
         if not txt:
