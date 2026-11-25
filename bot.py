@@ -1,9 +1,10 @@
 import asyncio
+from collections import Counter
+from difflib import SequenceMatcher
 import glob
 import os
 import re
 import tempfile
-from collections import Counter
 from docx import Document
 from docx.shared import Pt
 import pdfplumber
@@ -14,7 +15,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 
 try:
     import arabic_reshaper
@@ -120,6 +121,19 @@ def is_junk_short_line(line: str) -> bool:
     return False
 
 
+def is_similar_to_existing(candidate_norm: str, existing_norms: list[str], threshold: float = 0.85) -> bool:
+    if len(candidate_norm) < 20:
+        return False
+    for prev in existing_norms:
+        if len(prev) < 20:
+            continue
+        if candidate_norm in prev or prev in candidate_norm:
+            return True
+        if SequenceMatcher(None, candidate_norm, prev).ratio() >= threshold:
+            return True
+    return False
+
+
 def shape_for_reportlab(text: str) -> str:
     if not text:
         return ""
@@ -147,28 +161,32 @@ def find_ttf_font() -> str | None:
     return found[0] if found else None
 
 
-def extract_non_table_text(page) -> str:
-    """
-    يستخرج نص الصفحة مع استبعاد المناطق التي تقع داخل حدود الجداول لتجنب تكرار الجدول كنص.
-    """
-    table_bboxes = [tbl.bbox for tbl in page.find_tables()]
-    if not table_bboxes:
-        return page.extract_text() or ""
+def collect_table_cell_norms(tables: list[list[list[str | None]]]) -> set[str]:
+    cell_norms = set()
+    for tbl in tables:
+        for row in tbl:
+            for cell in row or []:
+                cleaned = fix_arabic_text((cell or "").replace("\n", " "))
+                norm = normalize_for_dedup(cleaned)
+                if len(norm) >= 3:
+                    cell_norms.add(norm)
+    return cell_norms
 
-    def inside_any_table(obj) -> bool:
-        x0 = obj.get("x0", 0)
-        top = obj.get("top", 0)
-        x1 = obj.get("x1", 0)
-        bottom = obj.get("bottom", 0)
-        cx = (x0 + x1) / 2.0
-        cy = (top + bottom) / 2.0
-        for tx0, ttop, tx1, tbottom in table_bboxes:
-            if tx0 <= cx <= tx1 and ttop <= cy <= tbottom:
-                return True
+
+def line_matches_table_content(line: str, table_cell_norms: set[str]) -> bool:
+    if not table_cell_norms:
         return False
-
-    filtered_page = page.filter(lambda obj: not inside_any_table(obj))
-    return filtered_page.extract_text() or ""
+    norm = normalize_for_dedup(line)
+    if not norm:
+        return False
+    if norm in table_cell_norms:
+        return True
+    tokens = [t for t in re.split(r"[\|\s]+", line) if len(normalize_for_dedup(t)) >= 4]
+    if len(tokens) >= 2:
+        matched = sum(1 for t in tokens if normalize_for_dedup(t) in table_cell_norms)
+        if matched / len(tokens) >= 0.6:
+            return True
+    return False
 
 
 def add_table_to_docx(word_doc: Document, raw_rows: list[list[str | None]]):
@@ -222,7 +240,7 @@ def convert_pdf_to_word(pdf_file_path: str, docx_file_path: str):
         global_norm_counter = Counter()
 
         for page in pdf.pages:
-            raw_text = extract_non_table_text(page)
+            raw_text = page.extract_text() or ""
             tables = page.extract_tables() or []
 
             current_lines = []
@@ -250,12 +268,16 @@ def convert_pdf_to_word(pdf_file_path: str, docx_file_path: str):
             heading = word_doc.add_heading(f"صفحة {page_num}", level=2)
             heading.paragraph_format.bidi = True
 
+            table_cell_norms = collect_table_cell_norms(tables)
             norm_list = [normalize_for_dedup(l) for l in lines]
             local_norm_counter = Counter(n for n in norm_list if len(n) >= 5)
-            seen_long_norm_in_page = set()
+            accepted_long_norms: list[str] = []
             clean_page_lines = []
 
             for line in lines:
+                if line_matches_table_content(line, table_cell_norms):
+                    continue
+
                 norm = normalize_for_dedup(line)
                 if norm in repeated_across_pages:
                     continue
@@ -263,12 +285,12 @@ def convert_pdf_to_word(pdf_file_path: str, docx_file_path: str):
                     continue
                 if clean_page_lines and normalize_for_dedup(clean_page_lines[-1]) == norm and len(norm) >= 4:
                     continue
-                if len(norm) >= 20 and norm in seen_long_norm_in_page:
+                if is_similar_to_existing(norm, accepted_long_norms):
                     continue
 
                 clean_page_lines.append(line)
                 if len(norm) >= 20:
-                    seen_long_norm_in_page.add(norm)
+                    accepted_long_norms.append(norm)
 
             if not clean_page_lines and not tables:
                 p = word_doc.add_paragraph(
