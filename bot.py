@@ -1,3 +1,4 @@
+import asyncio
 import os
 import tempfile
 from collections import Counter
@@ -124,6 +125,9 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def run_bot():
     if not BOT_TOKEN:
         raise RuntimeError("لم يتم العثور على متغير البيئة BOT_TOKEN.")
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
 
     application = ApplicationBuilder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
