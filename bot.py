@@ -6,12 +6,7 @@ import os
 import re
 import tempfile
 from docx import Document
-from docx.document import Document as DocxDocument
-from docx.oxml.table import CT_Tbl
-from docx.oxml.text.paragraph import CT_P
 from docx.shared import Pt
-from docx.table import _Cell, Table as DocxTable
-from docx.text.paragraph import Paragraph as DocxParagraph
 import pdfplumber
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
@@ -100,8 +95,6 @@ def fix_arabic_text(text: str) -> str:
     for wrong, right in common_fixes.items():
         text = re.sub(rf"\b{re.escape(wrong)}\b", right, text)
 
-    text = re.sub(r"([\u0600-\u06FFA-Za-z])(\d)", r"\1 \2", text)
-    text = re.sub(r"(\d)([\u0600-\u06FFA-Za-z])", r"\1 \2", text)
     text = re.sub(r"[ \t]+", " ", text)
     return text.strip()
 
@@ -137,18 +130,6 @@ def is_similar_to_existing(candidate_norm: str, existing_norms: list[str], thres
         if SequenceMatcher(None, candidate_norm, prev).ratio() >= threshold:
             return True
     return False
-
-
-def shape_for_reportlab(text: str) -> str:
-    if not text:
-        return ""
-    if has_arabic(text) and HAS_ARABIC_SHAPER:
-        try:
-            reshaped = arabic_reshaper.reshape(text)
-            return get_display(reshaped)
-        except Exception:
-            return text
-    return text
 
 
 def find_ttf_font() -> str | None:
@@ -341,22 +322,7 @@ def convert_pdf_to_word(pdf_file_path: str, docx_file_path: str):
     word_doc.save(docx_file_path)
 
 
-def iter_block_items(parent):
-    if isinstance(parent, DocxDocument):
-        parent_elm = parent.element.body
-    elif isinstance(parent, _Cell):
-        parent_elm = parent._tc
-    else:
-        return
-
-    for child in parent_elm.iterchildren():
-        if isinstance(child, CT_P):
-            yield DocxParagraph(child, parent)
-        elif isinstance(child, CT_Tbl):
-            yield DocxTable(child, parent)
-
-
-def escape_for_platypus_paragraph(text: str) -> str:
+def escape_xml_for_platypus(text: str) -> str:
     return (
         text.replace("&", "&amp;")
         .replace("<", "&lt;")
@@ -365,16 +331,51 @@ def escape_for_platypus_paragraph(text: str) -> str:
 
 
 def format_for_pdf_paragraph(text: str, use_arabic_font: bool) -> str:
-    if has_arabic(text) and use_arabic_font and HAS_ARABIC_SHAPER:
-        try:
-            if re.fullmatch(r"[\d\s\.\,\-\/\:\+\=\(\)\[\]\{\}%$€£]+", text.strip()):
-                return escape_for_platypus_paragraph(text)
-            reshaped = arabic_reshaper.reshape(text)
-            bidi_text = get_display(reshaped)
-            return escape_for_platypus_paragraph(bidi_text)
-        except Exception:
-            return escape_for_platypus_paragraph(text)
-    return escape_for_platypus_paragraph(text)
+    """
+    يحمي الأرقام والتواريخ والروابط والرموز الإنجليزية من عكس BiDi قدر الإمكان،
+    ثم يشكل النص العربي ويعرضه قبل عمل XML escape.
+    """
+    if not text:
+        return ""
+
+    if not use_arabic_font or not has_arabic(text) or not HAS_ARABIC_SHAPER:
+        return escape_xml_for_platypus(text)
+
+    # إذا كان النص أرقامًا ورموزًا فقط بدون حروف عربية متصلة ككلمات
+    if re.fullmatch(r"[\d\s\.\,\-\/\:\+\=\(\)\[\]\{\}%$€£]+", text.strip()):
+        return escape_xml_for_platypus(text)
+
+    protected_tokens: list[str] = []
+
+    def protect_match(match: re.Match) -> str:
+        idx = len(protected_tokens)
+        protected_tokens.append(match.group(0))
+        # رمز مؤقت أحرف لاتينية بسيطة لا يتأثر بتشكيل العربية
+        return f"XYZTOK{idx}ZYX"
+
+    # حماية الروابط، الإيميل، التواريخ، الكلمات/الأكواد الإنجليزية، والأرقام المركبة
+    pattern = re.compile(
+        r"(https?://\S+|[\w\.\-]+@[\w\.\-]+|\d{1,4}[/-]\d{1,2}[/-]\d{1,4}|[A-Za-z0-9_./+-]{3,}|\d+(?:[.,]\d+)*%?)"
+    )
+    temp_text = pattern.sub(protect_match, text)
+
+    try:
+        reshaped = arabic_reshaper.reshape(temp_text)
+        bidi_text = get_display(reshaped)
+    except Exception:
+        bidi_text = temp_text
+
+    # إعادة المقاطع المحمية إلى مكانها بعد get_display
+    for idx, original_tok in enumerate(protected_tokens):
+        placeholder = f"XYZTOK{idx}ZYX"
+        # قد تعكس get_display مكان أو ترتيب الـ placeholder نفسه
+        if placeholder in bidi_text:
+            bidi_text = bidi_text.replace(placeholder, original_tok)
+        reversed_ph = placeholder[::-1]
+        if reversed_ph in bidi_text:
+            bidi_text = bidi_text.replace(reversed_ph, original_tok)
+
+    return escape_xml_for_platypus(bidi_text)
 
 
 def convert_word_to_pdf(docx_file_path: str, pdf_file_path: str):
@@ -424,61 +425,63 @@ def convert_word_to_pdf(docx_file_path: str, pdf_file_path: str):
     story = []
     has_content = False
 
-    for block in iter_block_items(doc):
-        if isinstance(block, DocxParagraph):
-            txt = fix_arabic_text(block.text or "")
-            if not txt:
+    # إضافة الفقرات بالترتيب المباشر والواضح
+    for p in doc.paragraphs:
+        txt = fix_arabic_text(p.text or "")
+        if not txt:
+            continue
+        has_content = True
+        for subline in txt.splitlines():
+            clean_sub = fix_arabic_text(subline)
+            if not clean_sub:
                 continue
+            formatted_txt = format_for_pdf_paragraph(clean_sub, use_arabic_font)
+            style_to_use = ar_style if (has_arabic(clean_sub) and use_arabic_font) else ltr_style
+            story.append(Paragraph(formatted_txt, style_to_use))
+
+    # إضافة الجداول بعدها بشكل مرتب ومنظم
+    for table in doc.tables:
+        table_data = []
+        for row in table.rows:
+            row_cells = []
+            for cell in row.cells:
+                cell_txt = fix_arabic_text(cell.text.replace("\n", " "))
+                formatted_cell = format_for_pdf_paragraph(cell_txt, use_arabic_font)
+                cell_style = ar_style if (has_arabic(cell_txt) and use_arabic_font) else ltr_style
+                row_cells.append(Paragraph(formatted_cell, cell_style))
+            if any(c.text.strip() for c in row_cells):
+                table_data.append(row_cells)
+
+        if table_data:
             has_content = True
-            for subline in txt.splitlines():
-                clean_sub = fix_arabic_text(subline)
-                if not clean_sub:
-                    continue
-                formatted_txt = format_for_pdf_paragraph(clean_sub, use_arabic_font)
-                style_to_use = ar_style if (has_arabic(clean_sub) and use_arabic_font) else ltr_style
-                story.append(Paragraph(formatted_txt, style_to_use))
+            cols_count = max(len(r) for r in table_data)
+            for r in table_data:
+                while len(r) < cols_count:
+                    r.append(Paragraph("", ltr_style))
 
-        elif isinstance(block, DocxTable):
-            table_data = []
-            for row in block.rows:
-                row_cells = []
-                for cell in row.cells:
-                    cell_txt = fix_arabic_text(cell.text.replace("\n", " "))
-                    formatted_cell = format_for_pdf_paragraph(cell_txt, use_arabic_font)
-                    cell_style = ar_style if (has_arabic(cell_txt) and use_arabic_font) else ltr_style
-                    row_cells.append(Paragraph(formatted_cell, cell_style))
-                if any(c.text.strip() for c in row_cells):
-                    table_data.append(row_cells)
+            usable_width = A4[0] - 72
+            col_w = usable_width / cols_count
 
-            if table_data:
-                has_content = True
-                cols_count = max(len(r) for r in table_data)
-                for r in table_data:
-                    while len(r) < cols_count:
-                        r.append(Paragraph("", ltr_style))
-
-                usable_width = A4[0] - 72
-                col_w = usable_width / cols_count
-
-                t = Table(table_data, colWidths=[col_w] * cols_count, repeatRows=1)
-                t.setStyle(
-                    TableStyle(
-                        [
-                            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1e3a5f")),
-                            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                            ("BACKGROUND", (0, 1), (-1, -1), colors.HexColor("#f8fafc")),
-                            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f1f5f9")]),
-                            ("GRID", (0, 0), (-1, -1), 0.6, colors.HexColor("#cbd5e1")),
-                            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                            ("TOPPADDING", (0, 0), (-1, -1), 6),
-                            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-                            ("LEFTPADDING", (0, 0), (-1, -1), 6),
-                            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-                        ]
-                    )
+            t = Table(table_data, colWidths=[col_w] * cols_count, repeatRows=1)
+            t.setStyle(
+                TableStyle(
+                    [
+                        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1e3a5f")),
+                        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                        ("BACKGROUND", (0, 1), (-1, -1), colors.HexColor("#f8fafc")),
+                        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f1f5f9")]),
+                        ("GRID", (0, 0), (-1, -1), 0.6, colors.HexColor("#cbd5e1")),
+                        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                        ("TOPPADDING", (0, 0), (-1, -1), 6),
+                        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                    ]
                 )
-                story.append(t)
-                story.append(Spacer(1, 10))
+            )
+            story.append(Spacer(1, 6))
+            story.append(t)
+            story.append(Spacer(1, 10))
 
     if not has_content:
         empty_msg = format_for_pdf_paragraph("الملف فارغ أو لا يحتوي على نصوص قابلة للتحويل.", use_arabic_font)
