@@ -6,7 +6,12 @@ import os
 import re
 import tempfile
 from docx import Document
+from docx.document import Document as DocxDocument
+from docx.oxml.table import CT_Tbl
+from docx.oxml.text.paragraph import CT_P
 from docx.shared import Pt
+from docx.table import _Cell, Table as DocxTable
+from docx.text.paragraph import Paragraph as DocxParagraph
 import pdfplumber
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
@@ -336,17 +341,61 @@ def convert_pdf_to_word(pdf_file_path: str, docx_file_path: str):
     word_doc.save(docx_file_path)
 
 
+def iter_block_items(parent):
+    if isinstance(parent, DocxDocument):
+        parent_elm = parent.element.body
+    elif isinstance(parent, _Cell):
+        parent_elm = parent._tc
+    else:
+        return
+
+    for child in parent_elm.iterchildren():
+        if isinstance(child, CT_P):
+            yield DocxParagraph(child, parent)
+        elif isinstance(child, CT_Tbl):
+            yield DocxTable(child, parent)
+
+
+def escape_for_platypus_paragraph(text: str) -> str:
+    """
+    حماية النص من تحليل وسوم XML في reportlab مع الحفاظ على الرموز قدر الإمكان.
+    """
+    escaped = (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+    return escaped
+
+
+def format_for_pdf_paragraph(text: str, use_arabic_font: bool) -> str:
+    escaped = escape_for_platypus_paragraph(text)
+    if has_arabic(text) and use_arabic_font and HAS_ARABIC_SHAPER:
+        try:
+            # تجنب قلب الأرقام التسلسلية الواضحة عبر reshaper إذا كان السطر أرقام ورموز فقط
+            if re.fullmatch(r"[\d\s\.\,\-\/\:\+\=\(\)\[\]\{\}%$€£]+", text.strip()):
+                return escaped
+            reshaped = arabic_reshaper.reshape(escaped)
+            return get_display(reshaped)
+        except Exception:
+            return escaped
+    return escaped
+
+
 def convert_word_to_pdf(docx_file_path: str, pdf_file_path: str):
     doc = Document(docx_file_path)
 
     font_name = "Helvetica"
     ttf_path = find_ttf_font()
+    use_arabic_font = False
     if ttf_path:
         try:
             pdfmetrics.registerFont(TTFont("CustomFont", ttf_path))
             font_name = "CustomFont"
+            use_arabic_font = True
         except Exception:
             font_name = "Helvetica"
+            use_arabic_font = False
 
     pdf_doc = SimpleDocTemplate(
         pdf_file_path,
@@ -364,7 +413,7 @@ def convert_word_to_pdf(docx_file_path: str, pdf_file_path: str):
         fontName=font_name,
         fontSize=11,
         leading=18,
-        alignment=2 if font_name != "Helvetica" else 0,
+        alignment=2 if use_arabic_font else 0,
         spaceAfter=6,
     )
     ltr_style = ParagraphStyle(
@@ -380,73 +429,65 @@ def convert_word_to_pdf(docx_file_path: str, pdf_file_path: str):
     story = []
     has_content = False
 
-    for p in doc.paragraphs:
-        txt = fix_arabic_text(p.text or "")
-        if not txt:
-            continue
-        has_content = True
-        for subline in txt.splitlines():
-            clean_sub = fix_arabic_text(subline)
-            if not clean_sub:
+    for block in iter_block_items(doc):
+        if isinstance(block, DocxParagraph):
+            txt = fix_arabic_text(block.text or "")
+            if not txt:
                 continue
-            safe_text = (
-                clean_sub.replace("&", "&amp;")
-                .replace("<", "&lt;")
-                .replace(">", "&gt;")
-            )
-            shaped = shape_for_reportlab(safe_text)
-            style_to_use = ar_style if (has_arabic(clean_sub) and font_name != "Helvetica") else ltr_style
-            story.append(Paragraph(shaped, style_to_use))
-
-    for table in doc.tables:
-        table_data = []
-        for row in table.rows:
-            row_cells = []
-            for cell in row.cells:
-                cell_txt = fix_arabic_text(cell.text.replace("\n", " "))
-                safe_cell = (
-                    cell_txt.replace("&", "&amp;")
-                    .replace("<", "&lt;")
-                    .replace(">", "&gt;")
-                )
-                shaped_cell = shape_for_reportlab(safe_cell)
-                cell_style = ar_style if (has_arabic(cell_txt) and font_name != "Helvetica") else ltr_style
-                row_cells.append(Paragraph(shaped_cell, cell_style))
-            if any(c.text.strip() for c in row_cells):
-                table_data.append(row_cells)
-
-        if table_data:
             has_content = True
-            cols_count = max(len(r) for r in table_data)
-            for r in table_data:
-                while len(r) < cols_count:
-                    r.append(Paragraph("", ltr_style))
+            for subline in txt.splitlines():
+                clean_sub = fix_arabic_text(subline)
+                if not clean_sub:
+                    continue
+                formatted_txt = format_for_pdf_paragraph(clean_sub, use_arabic_font)
+                style_to_use = ar_style if (has_arabic(clean_sub) and use_arabic_font) else ltr_style
+                story.append(Paragraph(formatted_txt, style_to_use))
 
-            usable_width = A4[0] - 72
-            col_w = usable_width / cols_count
+        elif isinstance(block, DocxTable):
+            table_data = []
+            for row in block.rows:
+                row_cells = []
+                for cell in row.cells:
+                    cell_txt = fix_arabic_text(cell.text.replace("\n", " "))
+                    formatted_cell = format_for_pdf_paragraph(cell_txt, use_arabic_font)
+                    cell_style = ar_style if (has_arabic(cell_txt) and use_arabic_font) else ltr_style
+                    row_cells.append(Paragraph(formatted_cell, cell_style))
+                if any(c.text.strip() for c in row_cells):
+                    table_data.append(row_cells)
 
-            t = Table(table_data, colWidths=[col_w] * cols_count, repeatRows=1)
-            t.setStyle(
-                TableStyle(
-                    [
-                        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1e3a5f")),
-                        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                        ("BACKGROUND", (0, 1), (-1, -1), colors.HexColor("#f8fafc")),
-                        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f1f5f9")]),
-                        ("GRID", (0, 0), (-1, -1), 0.6, colors.HexColor("#cbd5e1")),
-                        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                        ("TOPPADDING", (0, 0), (-1, -1), 6),
-                        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-                        ("LEFTPADDING", (0, 0), (-1, -1), 6),
-                        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-                    ]
+            if table_data:
+                has_content = True
+                cols_count = max(len(r) for r in table_data)
+                for r in table_data:
+                    while len(r) < cols_count:
+                        r.append(Paragraph("", ltr_style))
+
+                usable_width = A4[0] - 72
+                col_w = usable_width / cols_count
+
+                t = Table(table_data, colWidths=[col_w] * cols_count, repeatRows=1)
+                t.setStyle(
+                    TableStyle(
+                        [
+                            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1e3a5f")),
+                            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                            ("BACKGROUND", (0, 1), (-1, -1), colors.HexColor("#f8fafc")),
+                            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f1f5f9")]),
+                            ("GRID", (0, 0), (-1, -1), 0.6, colors.HexColor("#cbd5e1")),
+                            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                            ("TOPPADDING", (0, 0), (-1, -1), 6),
+                            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                            ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                        ]
+                    )
                 )
-            )
-            story.append(t)
-            story.append(Spacer(1, 10))
+                story.append(t)
+                story.append(Spacer(1, 10))
 
     if not has_content:
-        story.append(Paragraph(shape_for_reportlab("الملف فارغ أو لا يحتوي على نصوص قابلة للتحويل."), ar_style))
+        empty_msg = format_for_pdf_paragraph("الملف فارغ أو لا يحتوي على نصوص قابلة للتحويل.", use_arabic_font)
+        story.append(Paragraph(empty_msg, ar_style if use_arabic_font else ltr_style))
 
     pdf_doc.build(story)
 
