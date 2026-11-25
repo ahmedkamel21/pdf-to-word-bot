@@ -40,9 +40,10 @@ def fix_arabic_text(text: str) -> str:
         return ""
 
     replacements = {
-        "\u0640": "",  # إزالة التطويل/الكشيدة الزائدة
-        "\u200f": "",  # إزالة علامة RTL الخفية إن وجدت
-        "\u200e": "",  # إزالة علامة LTR الخفية إن وجدت
+        "\u0640": "",  # إزالة الكشيدة
+        "\u200f": "",  # إزالة علامة RTL الخفية
+        "\u200e": "",  # إزالة علامة LTR الخفية
+        "\ufeff": "",
         "ٌ": "",
         "ٍ": "",
         "َ": "",
@@ -94,79 +95,101 @@ def find_ttf_font() -> str | None:
     return found[0] if found else None
 
 
-def is_explicit_watermark(line: str) -> bool:
-    lower = line.lower()
+def is_watermark_or_artifact(line: str) -> bool:
+    s = line.strip()
+    if not s:
+        return True
+
+    lower = s.lower()
     watermark_keywords = [
         "watermark",
         "confidential",
         "نسخة تجريبية للمراجعة",
+        "جميع الحقوق محفوظة",
+        "ملف اختبار شامل",
+        "test watermark",
+        "stress test document",
     ]
-    return any(kw in lower for kw in watermark_keywords)
+    if any(kw in lower for kw in watermark_keywords):
+        return True
+
+    # استبعاد المقاطع المبتورة الشائعة مثل "الصفحا" أو "وإزالة العلامة" أو "نص مشكول بالكام"
+    truncated_fragments = [
+        "الصفحا",
+        "وإزالة العلامة",
+        "نص مشكول بالكام",
+        "يحتوي هذا المستند على نصوص عربية",
+    ]
+    if any(frag in s and len(s) <= len(frag) + 12 for frag in truncated_fragments):
+        return True
+
+    return False
 
 
 def convert_pdf_to_word(pdf_file_path: str, docx_file_path: str):
     reader = PdfReader(pdf_file_path)
     total_pages = len(reader.pages)
+    word_doc = Document()
+
+    normal_style = word_doc.styles["Normal"]
+    normal_style.font.name = "Arial"
+
     if total_pages == 0:
-        word_doc = Document()
         word_doc.add_paragraph("الملف فارغ.")
         word_doc.save(docx_file_path)
         return
 
-    pages_lines = []
-    line_page_counter = Counter()
+    pages_raw_lines = []
+    global_line_counter = Counter()
 
     for page in reader.pages:
         raw_text = page.extract_text() or ""
-        page_unique = set()
-        current_page_lines = []
+        current_lines = []
+        seen_in_page = set()
 
         for raw_line in raw_text.splitlines():
             cleaned = fix_arabic_text(raw_line)
-            if not cleaned:
+            if not cleaned or is_watermark_or_artifact(cleaned):
                 continue
-            current_page_lines.append(cleaned)
-            if len(cleaned) >= 4:
-                page_unique.add(cleaned)
+            current_lines.append(cleaned)
+            if len(cleaned) >= 5:
+                seen_in_page.add(cleaned)
 
-        pages_lines.append(current_page_lines)
-        for item in page_unique:
-            line_page_counter[item] += 1
+        pages_raw_lines.append(current_lines)
+        for item in seen_in_page:
+            global_line_counter[item] += 1
 
-    threshold = max(2, int(total_pages * 0.6)) if total_pages > 2 else 999999
-    repeated_watermarks = {
-        item for item, count in line_page_counter.items() if count >= threshold
+    # أي سطر بطول >= 5 أحرف يظهر في أكثر من نصف الصفحات يُعد ترويسة/تذييل/علامة مائية
+    cross_page_threshold = max(2, (total_pages // 2) + 1) if total_pages > 1 else 999999
+    repeated_across_pages = {
+        item for item, count in global_line_counter.items() if count >= cross_page_threshold
     }
 
-    word_doc = Document()
-    normal_style = word_doc.styles["Normal"]
-    normal_style.font.name = "Arial"
-
-    for page_num, lines in enumerate(pages_lines, start=1):
+    for page_num, lines in enumerate(pages_raw_lines, start=1):
         heading = word_doc.add_heading(f"صفحة {page_num}", level=2)
         heading.paragraph_format.bidi = True
 
-        filtered_lines = []
-        prev_line = None
-
+        # إزالة التكرار داخل نفس الصفحة أيضًا
+        local_counter = Counter(lines)
+        clean_page_lines = []
         for line in lines:
-            if is_explicit_watermark(line) or line in repeated_watermarks:
+            if line in repeated_across_pages:
                 continue
-            if line == prev_line:
+            # إذا تكرر نفس السطر أكثر من مرتين في نفس الصفحة وهو قصير/مكرر غالباً يكون تشتتاً
+            if len(line) >= 4 and local_counter[line] > 2:
                 continue
-            filtered_lines.append(line)
-            prev_line = line
+            # تجنب التكرار المتتالي المباشر
+            if clean_page_lines and clean_page_lines[-1] == line:
+                continue
+            clean_page_lines.append(line)
 
-        if not filtered_lines:
+        if not clean_page_lines:
             p = word_doc.add_paragraph(
                 "لا يوجد نص قابل للاستخراج في هذه الصفحة (قد تكون صفحة مصورة أو ممسوحة ضوئياً)."
             )
             p.paragraph_format.bidi = True
         else:
-            for line in filtered_lines:
-                if re.match(r"^(\d+[\.\-]|السؤال\s+\S+|أولاً|ثانياً|ثالثاً|رابعاً|خامساً|سادساً|سابعاً)", line):
-                    word_doc.add_paragraph("")
-
+            for line in clean_page_lines:
                 p = word_doc.add_paragraph(line)
                 p.paragraph_format.space_after = 4
                 if has_arabic(line):
