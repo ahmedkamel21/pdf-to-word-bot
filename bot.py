@@ -331,17 +331,12 @@ def escape_xml_for_platypus(text: str) -> str:
 
 
 def format_for_pdf_paragraph(text: str, use_arabic_font: bool) -> str:
-    """
-    يحمي الأرقام والتواريخ والروابط والرموز الإنجليزية من عكس BiDi قدر الإمكان،
-    ثم يشكل النص العربي ويعرضه قبل عمل XML escape.
-    """
     if not text:
         return ""
 
     if not use_arabic_font or not has_arabic(text) or not HAS_ARABIC_SHAPER:
         return escape_xml_for_platypus(text)
 
-    # إذا كان النص أرقامًا ورموزًا فقط بدون حروف عربية متصلة ككلمات
     if re.fullmatch(r"[\d\s\.\,\-\/\:\+\=\(\)\[\]\{\}%$€£]+", text.strip()):
         return escape_xml_for_platypus(text)
 
@@ -350,10 +345,9 @@ def format_for_pdf_paragraph(text: str, use_arabic_font: bool) -> str:
     def protect_match(match: re.Match) -> str:
         idx = len(protected_tokens)
         protected_tokens.append(match.group(0))
-        # رمز مؤقت أحرف لاتينية بسيطة لا يتأثر بتشكيل العربية
-        return f"XYZTOK{idx}ZYX"
+        # استخدام نطاق PUA لتجنب أي تداخل مع تشكيل الحروف العربية أو الإنجليزية
+        return chr(0xE000 + idx)
 
-    # حماية الروابط، الإيميل، التواريخ، الكلمات/الأكواد الإنجليزية، والأرقام المركبة
     pattern = re.compile(
         r"(https?://\S+|[\w\.\-]+@[\w\.\-]+|\d{1,4}[/-]\d{1,2}[/-]\d{1,4}|[A-Za-z0-9_./+-]{3,}|\d+(?:[.,]\d+)*%?)"
     )
@@ -365,15 +359,10 @@ def format_for_pdf_paragraph(text: str, use_arabic_font: bool) -> str:
     except Exception:
         bidi_text = temp_text
 
-    # إعادة المقاطع المحمية إلى مكانها بعد get_display
     for idx, original_tok in enumerate(protected_tokens):
-        placeholder = f"XYZTOK{idx}ZYX"
-        # قد تعكس get_display مكان أو ترتيب الـ placeholder نفسه
+        placeholder = chr(0xE000 + idx)
         if placeholder in bidi_text:
             bidi_text = bidi_text.replace(placeholder, original_tok)
-        reversed_ph = placeholder[::-1]
-        if reversed_ph in bidi_text:
-            bidi_text = bidi_text.replace(reversed_ph, original_tok)
 
     return escape_xml_for_platypus(bidi_text)
 
@@ -425,7 +414,6 @@ def convert_word_to_pdf(docx_file_path: str, pdf_file_path: str):
     story = []
     has_content = False
 
-    # إضافة الفقرات بالترتيب المباشر والواضح
     for p in doc.paragraphs:
         txt = fix_arabic_text(p.text or "")
         if not txt:
@@ -439,7 +427,6 @@ def convert_word_to_pdf(docx_file_path: str, pdf_file_path: str):
             style_to_use = ar_style if (has_arabic(clean_sub) and use_arabic_font) else ltr_style
             story.append(Paragraph(formatted_txt, style_to_use))
 
-    # إضافة الجداول بعدها بشكل مرتب ومنظم
     for table in doc.tables:
         table_data = []
         for row in table.rows:
