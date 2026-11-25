@@ -5,11 +5,14 @@ import re
 import tempfile
 from collections import Counter
 from docx import Document
+from docx.shared import Inches, Pt
 from pypdf import PdfReader
+from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.pdfgen import canvas
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
@@ -26,8 +29,8 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "أهلاً بك! أرسل لي:\n"
-        "• ملف PDF لتحويله إلى Word (.docx) مع إزالة النصوص المكررة وتحسين النص العربي.\n"
-        "• أو ملف Word (.docx) لتحويله إلى PDF (.pdf)."
+        "• ملف PDF لتحويله إلى Word (.docx) مع إزالة النصوص المكررة وتنسيق الجداول والفقرات.\n"
+        "• أو ملف Word (.docx) لتحويله إلى PDF (.pdf) مع الحفاظ على الجداول والتنسيق قدر الإمكان."
     )
 
 
@@ -35,14 +38,37 @@ def has_arabic(text: str) -> bool:
     return any("\u0600" <= ch <= "\u06FF" for ch in text)
 
 
+def clean_noisy_fragments(text: str) -> str:
+    if not text:
+        return ""
+
+    text = re.sub(r"(?:الصفحا)+", " ", text)
+
+    noisy_patterns = [
+        r"confidential\s*watermark\s*2026",
+        r"test\s*watermark",
+        r"stress\s*test\s*document\s*#?2026",
+        r"نسخة\s*تجريبية\s*للمراجعة",
+        r"جميع\s*الحقوق\s*محفوظة\s*2026",
+        r"ملف\s*اختبار\s*شامل\s*-\s*علامة\s*مائية\s*نصية\s*متكررة\s*\|?",
+        r"وإزالة\s*العلامة(?:\s*المائية)?",
+        r"نص\s*مشكول\s*بالكام(?:ل)?",
+        r"يحتوي\s*هذا\s*المستند\s*على\s*نصوص\s*عربية[^\n]*",
+    ]
+    for pat in noisy_patterns:
+        text = re.sub(pat, " ", text, flags=re.IGNORECASE)
+
+    return text
+
+
 def fix_arabic_text(text: str) -> str:
     if not text:
         return ""
 
     replacements = {
-        "\u0640": "",  # إزالة الكشيدة
-        "\u200f": "",  # إزالة علامة RTL الخفية
-        "\u200e": "",  # إزالة علامة LTR الخفية
+        "\u0640": "",
+        "\u200f": "",
+        "\u200e": "",
         "\ufeff": "",
         "ٌ": "",
         "ٍ": "",
@@ -54,6 +80,8 @@ def fix_arabic_text(text: str) -> str:
     }
     for old, new in replacements.items():
         text = text.replace(old, new)
+
+    text = clean_noisy_fragments(text)
 
     common_fixes = {
         "التى": "التي",
@@ -70,14 +98,16 @@ def fix_arabic_text(text: str) -> str:
     return text.strip()
 
 
-def format_line_for_pdf(line: str) -> str:
-    if has_arabic(line) and HAS_ARABIC_SHAPER:
+def shape_for_reportlab(text: str) -> str:
+    if not text:
+        return ""
+    if has_arabic(text) and HAS_ARABIC_SHAPER:
         try:
-            reshaped = arabic_reshaper.reshape(line)
+            reshaped = arabic_reshaper.reshape(text)
             return get_display(reshaped)
         except Exception:
-            return line
-    return line
+            return text
+    return text
 
 
 def find_ttf_font() -> str | None:
@@ -95,35 +125,85 @@ def find_ttf_font() -> str | None:
     return found[0] if found else None
 
 
-def is_watermark_or_artifact(line: str) -> bool:
-    s = line.strip()
-    if not s:
-        return True
+def parse_table_row_if_any(line: str) -> list[str] | None:
+    """
+    يكتشف إذا كان السطر يمثل صف جدول (مفصول بـ '|' أو أعمدة متعددة واضحة).
+    """
+    if "|" in line:
+        cells = [c.strip() for c in line.split("|") if c.strip()]
+        if len(cells) >= 2:
+            return cells
+    return None
 
-    lower = s.lower()
-    watermark_keywords = [
-        "watermark",
-        "confidential",
-        "نسخة تجريبية للمراجعة",
-        "جميع الحقوق محفوظة",
-        "ملف اختبار شامل",
-        "test watermark",
-        "stress test document",
-    ]
-    if any(kw in lower for kw in watermark_keywords):
-        return True
 
-    # استبعاد المقاطع المبتورة الشائعة مثل "الصفحا" أو "وإزالة العلامة" أو "نص مشكول بالكام"
-    truncated_fragments = [
-        "الصفحا",
-        "وإزالة العلامة",
-        "نص مشكول بالكام",
-        "يحتوي هذا المستند على نصوص عربية",
-    ]
-    if any(frag in s and len(s) <= len(frag) + 12 for frag in truncated_fragments):
-        return True
+def add_lines_with_tables_to_docx(word_doc: Document, lines: list[str]):
+    """
+    يضيف الأسطر لملف Word مع تحويل تسلسل صفوف الجدول إلى جدول حقيقي.
+    """
+    pending_table_rows: list[list[str]] = []
 
-    return False
+    def flush_table():
+        nonlocal pending_table_rows
+        if not pending_table_rows:
+            return
+
+        max_cols = max(len(r) for r in pending_table_rows)
+        if max_cols < 2:
+            for r in pending_table_rows:
+                p = word_doc.add_paragraph(" | ".join(r))
+                if has_arabic(" ".join(r)):
+                    p.paragraph_format.bidi = True
+            pending_table_rows = []
+            return
+
+        tbl = word_doc.add_table(rows=len(pending_table_rows), cols=max_cols)
+        tbl.style = "Table Grid"
+
+        for r_idx, row_data in enumerate(pending_table_rows):
+            for c_idx in range(max_cols):
+                cell_text = row_data[c_idx] if c_idx < len(row_data) else ""
+                cell = tbl.cell(r_idx, c_idx)
+                cell.text = cell_text
+                for p in cell.paragraphs:
+                    p.paragraph_format.space_after = Pt(2)
+                    if has_arabic(cell_text):
+                        p.paragraph_format.bidi = True
+
+        word_doc.add_paragraph("")
+        pending_table_rows = []
+
+    for line in lines:
+        row_cells = parse_table_row_if_any(line)
+        if row_cells:
+            pending_table_rows.append(row_cells)
+            continue
+
+        flush_table()
+
+        is_heading = bool(
+            re.match(
+                r"^(\d+[\.\)]\s+.{2,60}|السؤال\s+\S+|أولاً|ثانياً|ثالثاً|رابعاً|خامساً|سادساً|سابعاً)",
+                line,
+            )
+            and len(line) <= 90
+        )
+
+        if is_heading:
+            h = word_doc.add_paragraph()
+            run = h.add_run(line)
+            run.bold = True
+            run.font.size = Pt(12)
+            h.paragraph_format.space_before = Pt(6)
+            h.paragraph_format.space_after = Pt(3)
+            if has_arabic(line):
+                h.paragraph_format.bidi = True
+        else:
+            p = word_doc.add_paragraph(line)
+            p.paragraph_format.space_after = Pt(4)
+            if has_arabic(line):
+                p.paragraph_format.bidi = True
+
+    flush_table()
 
 
 def convert_pdf_to_word(pdf_file_path: str, docx_file_path: str):
@@ -133,6 +213,7 @@ def convert_pdf_to_word(pdf_file_path: str, docx_file_path: str):
 
     normal_style = word_doc.styles["Normal"]
     normal_style.font.name = "Arial"
+    normal_style.font.size = Pt(11)
 
     if total_pages == 0:
         word_doc.add_paragraph("الملف فارغ.")
@@ -149,17 +230,16 @@ def convert_pdf_to_word(pdf_file_path: str, docx_file_path: str):
 
         for raw_line in raw_text.splitlines():
             cleaned = fix_arabic_text(raw_line)
-            if not cleaned or is_watermark_or_artifact(cleaned):
+            if not cleaned or cleaned in {"|", "/", "-", "—", "."}:
                 continue
             current_lines.append(cleaned)
-            if len(cleaned) >= 5:
+            if len(cleaned) >= 6:
                 seen_in_page.add(cleaned)
 
         pages_raw_lines.append(current_lines)
         for item in seen_in_page:
             global_line_counter[item] += 1
 
-    # أي سطر بطول >= 5 أحرف يظهر في أكثر من نصف الصفحات يُعد ترويسة/تذييل/علامة مائية
     cross_page_threshold = max(2, (total_pages // 2) + 1) if total_pages > 1 else 999999
     repeated_across_pages = {
         item for item, count in global_line_counter.items() if count >= cross_page_threshold
@@ -169,16 +249,13 @@ def convert_pdf_to_word(pdf_file_path: str, docx_file_path: str):
         heading = word_doc.add_heading(f"صفحة {page_num}", level=2)
         heading.paragraph_format.bidi = True
 
-        # إزالة التكرار داخل نفس الصفحة أيضًا
         local_counter = Counter(lines)
         clean_page_lines = []
         for line in lines:
             if line in repeated_across_pages:
                 continue
-            # إذا تكرر نفس السطر أكثر من مرتين في نفس الصفحة وهو قصير/مكرر غالباً يكون تشتتاً
-            if len(line) >= 4 and local_counter[line] > 2:
+            if len(line) >= 5 and local_counter[line] > 2:
                 continue
-            # تجنب التكرار المتتالي المباشر
             if clean_page_lines and clean_page_lines[-1] == line:
                 continue
             clean_page_lines.append(line)
@@ -189,11 +266,7 @@ def convert_pdf_to_word(pdf_file_path: str, docx_file_path: str):
             )
             p.paragraph_format.bidi = True
         else:
-            for line in clean_page_lines:
-                p = word_doc.add_paragraph(line)
-                p.paragraph_format.space_after = 4
-                if has_arabic(line):
-                    p.paragraph_format.bidi = True
+            add_lines_with_tables_to_docx(word_doc, clean_page_lines)
 
         if page_num < total_pages:
             word_doc.add_page_break()
@@ -203,8 +276,6 @@ def convert_pdf_to_word(pdf_file_path: str, docx_file_path: str):
 
 def convert_word_to_pdf(docx_file_path: str, pdf_file_path: str):
     doc = Document(docx_file_path)
-    c = canvas.Canvas(pdf_file_path, pagesize=A4)
-    width, height = A4
 
     font_name = "Helvetica"
     ttf_path = find_ttf_font()
@@ -215,54 +286,108 @@ def convert_word_to_pdf(docx_file_path: str, pdf_file_path: str):
         except Exception:
             font_name = "Helvetica"
 
-    margin_x = 45
-    top_y = height - 50
-    bottom_y = 50
-    line_height = 20
-    y = top_y
+    pdf_doc = SimpleDocTemplate(
+        pdf_file_path,
+        pagesize=A4,
+        leftMargin=36,
+        rightMargin=36,
+        topMargin=40,
+        bottomMargin=40,
+    )
 
-    c.setFont(font_name, 12)
+    styles = getSampleStyleSheet()
+    ar_style = ParagraphStyle(
+        "ArabicStyle",
+        parent=styles["Normal"],
+        fontName=font_name,
+        fontSize=11,
+        leading=18,
+        alignment=2 if font_name != "Helvetica" else 0,  # يمين للعربي عند توفر خط TTF
+        spaceAfter=6,
+    )
+    ltr_style = ParagraphStyle(
+        "LtrStyle",
+        parent=styles["Normal"],
+        fontName=font_name,
+        fontSize=10.5,
+        leading=16,
+        alignment=0,
+        spaceAfter=6,
+    )
 
-    all_lines = []
+    story = []
+    has_content = False
+
+    # المرور على العناصر بالترتيب الأصلي قدر الإمكان
     for p in doc.paragraphs:
         txt = fix_arabic_text(p.text or "")
-        if txt:
-            for subline in txt.splitlines():
-                clean_sub = fix_arabic_text(subline)
-                if clean_sub:
-                    all_lines.append(clean_sub)
+        if not txt:
+            continue
+        has_content = True
+        for subline in txt.splitlines():
+            clean_sub = fix_arabic_text(subline)
+            if not clean_sub:
+                continue
+            safe_text = (
+                clean_sub.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+            )
+            shaped = shape_for_reportlab(safe_text)
+            style_to_use = ar_style if (has_arabic(clean_sub) and font_name != "Helvetica") else ltr_style
+            story.append(Paragraph(shaped, style_to_use))
 
     for table in doc.tables:
+        table_data = []
         for row in table.rows:
-            row_cells = [
-                fix_arabic_text(cell.text.replace("\n", " "))
-                for cell in row.cells
-                if fix_arabic_text(cell.text)
-            ]
-            if row_cells:
-                all_lines.append(" | ".join(row_cells))
+            row_cells = []
+            for cell in row.cells:
+                cell_txt = fix_arabic_text(cell.text.replace("\n", " "))
+                safe_cell = (
+                    cell_txt.replace("&", "&amp;")
+                    .replace("<", "&lt;")
+                    .replace(">", "&gt;")
+                )
+                shaped_cell = shape_for_reportlab(safe_cell)
+                cell_style = ar_style if (has_arabic(cell_txt) and font_name != "Helvetica") else ltr_style
+                row_cells.append(Paragraph(shaped_cell, cell_style))
+            if any(c.text.strip() for c in row_cells):
+                table_data.append(row_cells)
 
-    if not all_lines:
-        all_lines = ["(الملف فارغ أو لا يحتوي على نصوص قابلة للتحويل)"]
+        if table_data:
+            has_content = True
+            cols_count = max(len(r) for r in table_data)
+            for r in table_data:
+                while len(r) < cols_count:
+                    r.append(Paragraph("", ltr_style))
 
-    for raw_line in all_lines:
-        max_chars = 85
-        chunks = [raw_line[i:i + max_chars] for i in range(0, len(raw_line), max_chars)]
+            usable_width = A4[0] - 72
+            col_w = usable_width / cols_count
 
-        for chunk in chunks:
-            if y <= bottom_y:
-                c.showPage()
-                c.setFont(font_name, 12)
-                y = top_y
+            t = Table(table_data, colWidths=[col_w] * cols_count, repeatRows=1)
+            t.setStyle(
+                TableStyle(
+                    [
+                        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1e3a5f")),
+                        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                        ("BACKGROUND", (0, 1), (-1, -1), colors.HexColor("#f8fafc")),
+                        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f1f5f9")]),
+                        ("GRID", (0, 0), (-1, -1), 0.6, colors.HexColor("#cbd5e1")),
+                        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                        ("TOPPADDING", (0, 0), (-1, -1), 6),
+                        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                    ]
+                )
+            )
+            story.append(t)
+            story.append(Spacer(1, 10))
 
-            display_text = format_line_for_pdf(chunk)
-            if has_arabic(chunk) and font_name != "Helvetica":
-                c.drawRightString(width - margin_x, y, display_text)
-            else:
-                c.drawString(margin_x, y, display_text)
-            y -= line_height
+    if not has_content:
+        story.append(Paragraph(shape_for_reportlab("الملف فارغ أو لا يحتوي على نصوص قابلة للتحويل."), ar_style))
 
-    c.save()
+    pdf_doc.build(story)
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
