@@ -147,6 +147,30 @@ def find_ttf_font() -> str | None:
     return found[0] if found else None
 
 
+def extract_non_table_text(page) -> str:
+    """
+    يستخرج نص الصفحة مع استبعاد المناطق التي تقع داخل حدود الجداول لتجنب تكرار الجدول كنص.
+    """
+    table_bboxes = [tbl.bbox for tbl in page.find_tables()]
+    if not table_bboxes:
+        return page.extract_text() or ""
+
+    def inside_any_table(obj) -> bool:
+        x0 = obj.get("x0", 0)
+        top = obj.get("top", 0)
+        x1 = obj.get("x1", 0)
+        bottom = obj.get("bottom", 0)
+        cx = (x0 + x1) / 2.0
+        cy = (top + bottom) / 2.0
+        for tx0, ttop, tx1, tbottom in table_bboxes:
+            if tx0 <= cx <= tx1 and ttop <= cy <= tbottom:
+                return True
+        return False
+
+    filtered_page = page.filter(lambda obj: not inside_any_table(obj))
+    return filtered_page.extract_text() or ""
+
+
 def add_table_to_docx(word_doc: Document, raw_rows: list[list[str | None]]):
     cleaned_rows: list[list[str]] = []
     for row in raw_rows:
@@ -198,7 +222,7 @@ def convert_pdf_to_word(pdf_file_path: str, docx_file_path: str):
         global_norm_counter = Counter()
 
         for page in pdf.pages:
-            raw_text = page.extract_text() or ""
+            raw_text = extract_non_table_text(page)
             tables = page.extract_tables() or []
 
             current_lines = []
