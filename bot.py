@@ -1,6 +1,7 @@
 import asyncio
 import glob
 import os
+import re
 import tempfile
 from collections import Counter
 from docx import Document
@@ -25,13 +26,56 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "أهلاً بك! أرسل لي:\n"
-        "• ملف PDF لتحويله إلى Word (.docx) مع محاولة إزالة النصوص المكررة.\n"
+        "• ملف PDF لتحويله إلى Word (.docx) مع محاولة إزالة النصوص المكررة وتحسين النص العربي.\n"
         "• أو ملف Word (.docx) لتحويله إلى PDF (.pdf)."
     )
 
 
 def has_arabic(text: str) -> bool:
     return any("\u0600" <= ch <= "\u06FF" for ch in text)
+
+
+def fix_arabic_text(text: str) -> str:
+    """
+    تحسين شائع للنصوص العربية المستخرجة من بعض ملفات PDF القديمة أو خطوط غير قياسية.
+    """
+    if not text:
+        return ""
+
+    # إزالة مسافات التمديد الزائدة وبعض الحروف الشاذة الشائعة في خطوط PDF القديمة
+    replacements = {
+        "\u0640": "",  # إزالة التطويل/الكشيدة الزائدة
+        "ى ": "ي ",
+        "ى\n": "ي\n",
+        "ٌ": "",
+        "ٍ": "",
+        "َ": "",
+        "ُ": "",
+        "ِ": "",
+        "ّ": "",
+        "ْ": "",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+
+    # تصحيح كلمات شائعة تظهر أحيانًا بـ "ى" بدل "ي" في نهاية أو وسط الكلمة في بعض ملفات PDF
+    common_fixes = {
+        "التى": "التي",
+        "فى": "في",
+        "الذى": "الذي",
+        "الثانى": "الثاني",
+        "الثالث": "الثالث",
+        "السؤال الثانى": "السؤال الثاني",
+        "السؤال الثالث": "السؤال الثالث",
+        "الفصل الدراسى": "الفصل الدراسي",
+        "تستطيع": "تستطيع",
+    }
+    for wrong, right in common_fixes.items():
+        text = re.sub(rf"\b{re.escape(wrong)}\b", right, text)
+
+    # ترتيب المسافات الزائدة داخل السطر
+    text = re.sub(r"[ \t]+", " ", text)
+    return text.strip()
 
 
 def format_line_for_pdf(line: str) -> str:
@@ -71,8 +115,8 @@ def remove_repeated_text_objects(reader: PdfReader) -> PdfWriter:
         lines_in_page = set()
         raw_text = page.extract_text() or ""
         for line in raw_text.splitlines():
-            clean_line = line.strip()
-            if len(clean_line) >= 3:
+            clean_line = fix_arabic_text(line)
+            if len(clean_line) >= 4:
                 lines_in_page.add(clean_line)
         for item in lines_in_page:
             line_counter[item] += 1
@@ -85,7 +129,7 @@ def remove_repeated_text_objects(reader: PdfReader) -> PdfWriter:
             try:
                 page.remove_text(
                     visitor_text=lambda text, cm, tm, font_dict, font_size: (
-                        "" if (text or "").strip() in repeated_lines else text
+                        "" if fix_arabic_text(text or "") in repeated_lines else text
                     )
                 )
             except Exception:
@@ -107,18 +151,36 @@ def convert_pdf_to_word(pdf_file_path: str, docx_file_path: str):
         clean_reader = PdfReader(cleaned_pdf_path)
         word_doc = Document()
 
-        for page_num, page in enumerate(clean_reader.pages, start=1):
-            word_doc.add_heading(f"صفحة {page_num}", level=2)
-            extracted_text = page.extract_text() or ""
-            lines = [line.strip() for line in extracted_text.splitlines() if line.strip()]
+        # ضبط نمط الفقرة الافتراضي
+        normal_style = word_doc.styles["Normal"]
+        normal_style.font.name = "Arial"
 
-            if not lines:
-                word_doc.add_paragraph(
+        for page_num, page in enumerate(clean_reader.pages, start=1):
+            heading = word_doc.add_heading(f"صفحة {page_num}", level=2)
+            heading.paragraph_format.bidi = True
+
+            extracted_text = page.extract_text() or ""
+            raw_lines = extracted_text.splitlines()
+
+            cleaned_lines = []
+            for line in raw_lines:
+                fixed = fix_arabic_text(line)
+                if fixed:
+                    cleaned_lines.append(fixed)
+
+            if not cleaned_lines:
+                p = word_doc.add_paragraph(
                     "لا يوجد نص قابل للاستخراج في هذه الصفحة (قد تكون صفحة مصورة أو ممسوحة ضوئياً)."
                 )
+                p.paragraph_format.bidi = True
             else:
-                for line in lines:
+                for line in cleaned_lines:
+                    # فصل الأسئلة الرئيسية في فقرة مستقلة لسهولة القراءة
+                    if re.match(r"^(السؤال\s+\S+|أولاً|ثانياً|ثالثاً|رابعاً|خامساً|سادساً|سابعاً)", line):
+                        word_doc.add_paragraph("")
+
                     paragraph = word_doc.add_paragraph(line)
+                    paragraph.paragraph_format.space_after = 4
                     if has_arabic(line):
                         paragraph.paragraph_format.bidi = True
 
@@ -155,15 +217,20 @@ def convert_word_to_pdf(docx_file_path: str, pdf_file_path: str):
 
     all_lines = []
     for p in doc.paragraphs:
-        txt = (p.text or "").strip()
+        txt = fix_arabic_text(p.text or "")
         if txt:
             for subline in txt.splitlines():
-                if subline.strip():
-                    all_lines.append(subline.strip())
+                clean_sub = fix_arabic_text(subline)
+                if clean_sub:
+                    all_lines.append(clean_sub)
 
     for table in doc.tables:
         for row in table.rows:
-            row_cells = [cell.text.strip().replace("\n", " ") for cell in row.cells if cell.text.strip()]
+            row_cells = [
+                fix_arabic_text(cell.text.replace("\n", " "))
+                for cell in row.cells
+                if fix_arabic_text(cell.text)
+            ]
             if row_cells:
                 all_lines.append(" | ".join(row_cells))
 
@@ -171,7 +238,6 @@ def convert_word_to_pdf(docx_file_path: str, pdf_file_path: str):
         all_lines = ["(الملف فارغ أو لا يحتوي على نصوص قابلة للتحويل)"]
 
     for raw_line in all_lines:
-        # تقسيم السطور الطويلة حسب العرض التقريبي للصفحة
         max_chars = 85
         chunks = [raw_line[i:i + max_chars] for i in range(0, len(raw_line), max_chars)]
 
