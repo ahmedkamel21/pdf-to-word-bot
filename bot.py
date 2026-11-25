@@ -181,10 +181,16 @@ def line_matches_table_content(line: str, table_cell_norms: set[str]) -> bool:
         return False
     if norm in table_cell_norms:
         return True
-    tokens = [t for t in re.split(r"[\|\s]+", line) if len(normalize_for_dedup(t)) >= 4]
-    if len(tokens) >= 2:
-        matched = sum(1 for t in tokens if normalize_for_dedup(t) in table_cell_norms)
-        if matched / len(tokens) >= 0.6:
+
+    for cell_norm in table_cell_norms:
+        if len(cell_norm) >= 5 and cell_norm in norm:
+            return True
+
+    tokens = [normalize_for_dedup(t) for t in re.split(r"[\|\s]+", line)]
+    tokens = [t for t in tokens if len(t) >= 3]
+    if tokens:
+        matched = sum(1 for t in tokens if any(t in cn or cn in t for cn in table_cell_norms))
+        if matched >= 2 or (matched / len(tokens)) >= 0.45:
             return True
     return False
 
